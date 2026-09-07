@@ -1,0 +1,12 @@
+node_modules/
+.local/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.log
+credentials*
+production-login*
+image-digest.txt
+SHA256SUMS.txt
+super-lan-cache-truenas.yaml

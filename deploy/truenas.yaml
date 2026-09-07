@@ -1,0 +1,40 @@
+# Replace every 192.168.1.10 and /mnt/tank/apps/super-lan-cache with your LAN address and datasets.
+# Existing caches: mount the folder containing CONFIGHASH and cache/, not cache/ itself.
+services:
+  lancache:
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.2
+    platform: linux/amd64
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "20722:20722"]
+    environment:
+      GUI_CACHE_IP: "192.168.1.10"
+      GUI_PUBLIC_ORIGIN: "http://192.168.1.10:20722"
+      CACHE_DISK_SIZE: "1000g"
+      CACHE_INDEX_SIZE: "500m"
+      MIN_FREE_DISK: "10g"
+      CACHE_MAX_AGE: "3560d"
+      UPSTREAM_DNS: "1.1.1.1 1.0.0.1"
+      TZ: "Etc/UTC"
+    volumes:
+      - type: bind
+        source: /mnt/tank/apps/super-lan-cache/cache
+        target: /data/cache
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/tank/apps/super-lan-cache/logs
+        target: /data/logs
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/tank/apps/super-lan-cache/manager
+        target: /data/manager
+        bind: {create_host_path: false}
+x-portals:
+  - name: Web UI
+    host: 192.168.1.10
+    port: 20722
+    scheme: http
+    path: /
+x-notes: >
+  Super Lan-Cache combines the cache engine and management interface in one container.
+  New installs have no login password; enable one in Settings if desired.
+  Super Pi Hole is optional. Existing cache files are inventoried automatically.

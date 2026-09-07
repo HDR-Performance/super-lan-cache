@@ -1,0 +1,11 @@
+*.cdn.blizzard.com
+blizzard.vo.llnwd.net
+blzddist1-a.akamaihd.net
+blzddist2-a.akamaihd.net
+blzddist3-a.akamaihd.net
+cdn.blizzard.com
+dist.blizzard.com
+dist.blizzard.com.edgesuite.net
+edge.blizzard.top.comcast.net
+level3.blizzard.com
+nydus.battle.net

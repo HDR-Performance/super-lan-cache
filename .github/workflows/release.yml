@@ -1,0 +1,49 @@
+name: Test and publish
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+        description: Publish the tested image and immutable prerelease
+permissions:
+  contents: read
+concurrency:
+  group: super-lan-cache-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  integrated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm run check && npm test
+      - run: docker build -t super-lan-cache:ci .
+      - run: docker compose -f deploy/truenas.yaml config --quiet
+      - run: node deploy/smoke.mjs super-lan-cache:ci
+      - name: Publish verified image and release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          VERSION=$(node -p 'require("./package.json").version')
+          if git ls-remote --exit-code origin "refs/tags/v$VERSION"; then exit 1; fi
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag super-lan-cache:ci "ghcr.io/hdr-performance/super-lan-cache:$VERSION"
+          docker push "ghcr.io/hdr-performance/super-lan-cache:$VERSION"
+          docker image inspect "ghcr.io/hdr-performance/super-lan-cache:$VERSION" --format '{{index .RepoDigests 0}}' > image-digest.txt
+          node deploy/release-assets.mjs
+          docker compose -f super-lan-cache-truenas.yaml config --quiet
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
+          gh release create "v$VERSION" --verify-tag --prerelease --title "Super Lan-Cache $VERSION" --notes-file docs/RELEASE.md super-lan-cache-truenas.yaml image-digest.txt SHA256SUMS.txt branding/icon.png branding/icon.svg

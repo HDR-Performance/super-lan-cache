@@ -1,0 +1,84 @@
+workflows:
+  version: 2.1
+  build_test_deploy:
+    jobs:
+      - test
+      - publish_latest:
+          context: docker-hub
+          requires:
+            - test
+          filters:
+             branches:
+               only: 
+                 - master
+      - build_children:
+          context: circle-api
+          requires:
+            - publish_latest
+
+version: 2.1
+executors:
+  testbuild-executor:
+    machine:
+      image: default
+jobs:
+  test:
+    executor: testbuild-executor
+    steps:
+      - checkout
+      - run:
+          name: Install goss
+          command: |
+            # rather than give internet scripts SU rights, we install to local user bin and add to path
+            [ -d ~/bin ] || mkdir ~/bin
+            export GOSS_DST=~/bin
+            export PATH=$PATH:~/bin
+            curl -fsSL https://goss.rocks/install | sh
+            goss -version
+      - run:
+          name: Test
+          command: |
+            # Don't forget path!
+            export PATH=$PATH:~/bin
+            ./run-tests.sh --circleci --keepimage
+      - run:
+          name: Save docker image
+          command: |
+            [ -d workspace ] || mkdir workspace
+            docker save -o workspace/lancachenet-monolithic.tar lancachenet/monolithic:goss-test
+            #Download from Artifacts and Load this into your own docker using the following command
+            #docker load -i /tmp/workspace/lancachenet-monolithic.tar
+      - store_test_results:
+          path: reports/goss/report.xml
+      - store_artifacts:
+          path: reports
+          destination: reports
+      - store_artifacts:
+          path: workspace/lancachenet-monolithic.tar
+          destination: docker-lancachenet-monolithic.tar
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            lancachenet-monolithic.tar
+  publish_latest:
+    executor: testbuild-executor
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: "Deploy latest to docker hub"
+          command: |
+            docker load -i /tmp/workspace/lancachenet-monolithic.tar
+            docker login -u $DOCKER_USER -p $DOCKER_PASS
+            docker tag lancachenet/monolithic:goss-test lancachenet/monolithic:latest
+            docker push lancachenet/monolithic:latest
+  build_children:
+    executor: testbuild-executor
+    steps:
+      - run:
+          name: "Request API to build children"
+          command: |
+              for child in {"generic"}; do
+                 echo "Asking API to trigger build for $child"
+                 curl -X POST --header "Content-Type: application/json" -d '{"branch":"master"}' https://circleci.com/api/v1.1/project/github/lancachenet/$child/build?circle-token=${CIRCLE_API_USER_TOKEN}
+              done

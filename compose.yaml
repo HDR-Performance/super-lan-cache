@@ -1,0 +1,27 @@
+# Standalone container: no Super Pi Hole dependency or Docker socket.
+# Set GUI_CACHE_IP and GUI_PUBLIC_ORIGIN for your own server before deployment.
+services:
+  lancache:
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "20722:20722"
+    environment:
+      GUI_CACHE_IP: "${LANCACHE_SERVER_IP:?Set LANCACHE_SERVER_IP to the cache server LAN IPv4 address}"
+      GUI_PUBLIC_ORIGIN: "${LANCACHE_PUBLIC_ORIGIN:-http://${LANCACHE_SERVER_IP}:20722}"
+      CACHE_DISK_SIZE: "1000g"
+      CACHE_INDEX_SIZE: "500m"
+      MIN_FREE_DISK: "10g"
+      CACHE_MAX_AGE: "3560d"
+      UPSTREAM_DNS: "1.1.1.1 1.0.0.1"
+      TZ: "Etc/UTC"
+    volumes:
+      - cache:/data/cache
+      - logs:/data/logs
+      - manager:/data/manager
+volumes:
+  cache:
+  logs:
+  manager:
