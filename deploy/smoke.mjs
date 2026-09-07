@@ -1,6 +1,7 @@
 import {execFileSync} from 'node:child_process';
 import assert from 'node:assert/strict';
 import {resolve} from 'node:path';
+import http from 'node:http';
 const image=process.argv[2]||'super-lan-cache:ci';
 const docker=(...args)=>execFileSync('docker',args,{encoding:'utf8'}).trim();
 const pause=()=>new Promise(r=>setTimeout(r,1000));
@@ -17,8 +18,13 @@ try{
  assert.equal((await api('session')).passwordRequired,false);
  assert.match(await (await fetch(base)).text(),/Super Lan-Cache/);
  assert.equal((await fetch(base+'/favicon.svg')).status,200);
- const request=()=>fetch('http://127.0.0.1:18080/depot/999999001/chunk/release-test',{headers:{Host:origin,'User-Agent':'Valve/Steam HTTP Client 1.0'}});
- for(let n=0;n<2;n++){const r=await request();assert.equal(r.status,200);const b=Buffer.from(await r.arrayBuffer());assert.equal(b.length,3145728);assert.ok(b.every(v=>v===71));await pause();}
+ // Use an explicit HTTP Host header. fetch normalizes Host to the URL authority.
+ const request=()=>new Promise((resolve,reject)=>{
+  const req=http.get('http://127.0.0.1:18080/depot/999999001/chunk/release-test',{headers:{Host:origin,'User-Agent':'Valve/Steam HTTP Client 1.0'}},res=>{
+   const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(chunks)}));res.on('error',reject);
+  });req.setTimeout(30000,()=>req.destroy(Error('Origin timeout')));req.on('error',reject);
+ });
+ for(let n=0;n<2;n++){const r=await request();assert.equal(r.status,200);const b=r.body;assert.equal(b.length,3145728);assert.ok(b.every(v=>v===71));await pause();}
  assert.match(docker('exec','slc-cache','cat','/data/logs/access.log'),/"HIT"/);
  await api('index',{});
  let library;
