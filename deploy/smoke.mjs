@@ -6,7 +6,7 @@ const image=process.argv[2]||'super-lan-cache:ci';
 const docker=(...args)=>execFileSync('docker',args,{encoding:'utf8'}).trim();
 const pause=()=>new Promise(r=>setTimeout(r,1000));
 const base='http://127.0.0.1:20722';
-async function api(route,data){const r=await fetch(base+'/api/'+route,{method:data?'POST':'GET',headers:{Origin:base,'Content-Type':'application/json','X-LanCache-Request':'1'},body:data?JSON.stringify(data):undefined});assert.equal(r.status,200,await r.clone().text());return r.json();}
+async function api(route,data,expectedStatus=200){const r=await fetch(base+'/api/'+route,{method:data?'POST':'GET',headers:{Origin:base,'Content-Type':'application/json','X-LanCache-Request':'1'},body:data?JSON.stringify(data):undefined});assert.equal(r.status,expectedStatus,await r.clone().text());return r.json();}
 try{
  docker('network','create','slc-ci');
  docker('run','-d','--name','slc-origin','--network','slc-ci','--entrypoint','node','-v',resolve('deploy/origin-fixture.mjs')+':/origin.mjs:ro',image,'/origin.mjs');
@@ -26,7 +26,7 @@ try{
  });
  for(let n=0;n<2;n++){const r=await request();assert.equal(r.status,200);const b=r.body;assert.equal(b.length,3145728);assert.ok(b.every(v=>v===71));await pause();}
  assert.match(docker('exec','slc-cache','cat','/data/logs/access.log'),/"HIT"/);
- await api('index',{});
+ await api('index',{},202);
  let library;
  for(let n=0;n<60;n++){library=await api('library');if(library.rows.some(x=>x.product==='depot:999999001'&&x.resident_bytes>0))break;await pause();}
  assert.ok(library.rows.some(x=>x.product==='depot:999999001'&&x.resident_bytes>0),'Real files must appear in the inventory');
