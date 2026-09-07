@@ -10,7 +10,7 @@ try{
  docker('network','create','slc-ci');
  docker('run','-d','--name','slc-origin','--network','slc-ci','--entrypoint','node','-v',resolve('deploy/origin-fixture.mjs')+':/origin.mjs:ro',image,'/origin.mjs');
  const origin=docker('inspect','slc-origin','--format','{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}');
- docker('run','-d','--name','slc-cache','--network','slc-ci','-p','127.0.0.1:18080:80','-p','127.0.0.1:20722:20722','-e','GUI_PUBLIC_ORIGIN='+base,'-e','GUI_CACHE_IP=127.0.0.1','-e','CACHE_DISK_SIZE=1g','-e','CACHE_INDEX_SIZE=10m','-e','MIN_FREE_DISK=1m',image);
+ docker('run','-d','--name','slc-cache','--network','slc-ci','-p','127.0.0.1:18080:80','-p','127.0.0.1:20722:20722','-e','GUI_PUBLIC_ORIGIN='+base,'-e','GUI_CACHE_IP=127.0.0.1','-e','CACHE_DISK_SIZE=2g','-e','CACHE_INDEX_SIZE=10m','-e','MIN_FREE_DISK=1g',image);
  let healthy=false;
  for(let n=0;n<120;n++){try{const r=await fetch(base+'/api/overview');if(r.ok&&(await r.json()).engine.healthy){healthy=true;break;}}catch{}await pause();}
  assert.ok(healthy,'Cache and GUI must become healthy');
