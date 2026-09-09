@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {isIP} from 'node:net';
-export const VERSION='0.1.2';
+export const VERSION='0.1.3';
 export const digest=s=>createHash('sha256').update(s).digest('hex');
 export const DEFAULTS={CACHE_DISK_SIZE:'1000g',CACHE_INDEX_SIZE:'500m',MIN_FREE_DISK:'10g',CACHE_MAX_AGE:'3560d',UPSTREAM_DNS:'8.8.8.8 8.8.4.4',NGINX_WORKER_PROCESSES:'auto'};
 export function validateSettings(input,addresses=[]){
@@ -26,6 +26,9 @@ export function identify(service,uri){
  else if(service==='xboxlive'){
   const file=path.split('/').pop(); const p=file.match(/^(.+?)_(\d+(?:\.\d+){1,5})_(.+?)\.(?:xvc|msixvc|appx|msix|eappx)(?:\..*)?$/i);
   if(p){product=p[1];version=p[2];kind='package';}else {product=file?.length>3?file.slice(0,160):'Unresolved Xbox content';kind='artifact';}
+ }else if(service==='epicgames'){
+  const dirs=path.split('/').filter(Boolean).map(x=>{try{return decodeURIComponent(x);}catch{return x;}}),cloud=dirs.findIndex(x=>/^CloudDir$/i.test(x)),scope=cloud>0?dirs.slice(0,cloud):dirs.slice(0,3),generic=/^(builds?|org|buildpatchservices|content|download|production)$/i;
+  product=[...scope].reverse().find(x=>!generic.test(x)&&x.length<100&&!/^[a-f0-9-]{24,}$/i.test(x))||'Unresolved Epic content';kind=product.startsWith('Unresolved')?'unresolved':'package';
  }else if(service==='wsus'){product=path.split('/').pop()?.slice(0,160)||'Unresolved Windows update';kind='artifact';}
  else {const dirs=path.split('/').filter(Boolean);product=dirs[0]||service;kind='unresolved';}
  const id=digest(`${service}\n${product}\n${version}`).slice(0,32);

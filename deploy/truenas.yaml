@@ -2,7 +2,7 @@
 # Existing caches: mount the folder containing CONFIGHASH and cache/, not cache/ itself.
 services:
   lancache:
-    image: ghcr.io/hdr-performance/super-lan-cache:0.1.2
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.3
     platform: linux/amd64
     restart: unless-stopped
     ports: ["80:80", "443:443", "20722:20722"]

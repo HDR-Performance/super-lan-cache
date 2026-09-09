@@ -16,6 +16,7 @@ export class Store{
    CREATE INDEX IF NOT EXISTS files_item ON files(item_id);
    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,time INTEGER,service TEXT,client TEXT,item_id TEXT,status INTEGER,bytes INTEGER,cache TEXT);
    CREATE INDEX IF NOT EXISTS events_time ON events(time);
+   CREATE TABLE IF NOT EXISTS client_aliases(client TEXT PRIMARY KEY,name TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS buckets(time INTEGER,service TEXT,bytes INTEGER,hits INTEGER,requests INTEGER,PRIMARY KEY(time,service));
    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,type TEXT,state TEXT,created INTEGER,updated INTEGER,details TEXT);
    CREATE TABLE IF NOT EXISTS manifest_refs(version_id TEXT,hash TEXT,PRIMARY KEY(version_id,hash));
@@ -87,13 +88,33 @@ export class Store{
   const rows=this.db.prepare(`SELECT i.*,COALESCE(f.resident_bytes,0) resident_bytes,COALESCE(f.file_count,0) file_count FROM items i LEFT JOIN (SELECT item_id,SUM(size) resident_bytes,COUNT(*) file_count FROM files GROUP BY item_id) f ON f.item_id=i.id ${where} ORDER BY resident_bytes DESC,i.last_seen DESC LIMIT 100 OFFSET ?`).all(...args,Math.max(0,Number(offset)||0));
   return {rows,total:this.db.prepare(`SELECT COUNT(*) n FROM items i ${where}`).get(...args).n,scan:this.scanState};
  }
+ activity({windowMs=30*60000,gapMs=120000,activeMs=20000,now=Date.now()}={}){
+  const rows=this.db.prepare(`SELECT e.*,COALESCE(i.custom_title,i.title) title,i.product,i.version,i.kind FROM events e JOIN items i ON i.id=e.item_id WHERE e.id IN (SELECT id FROM events WHERE time>? ORDER BY id DESC LIMIT 20000) ORDER BY e.time,e.id`).all(now-windowMs);
+  const aliases=new Map(this.db.prepare('SELECT client,name FROM client_aliases').all().map(r=>[r.client,r.name]));
+  const open=new Map(),sessions=[];
+  for(const row of rows){const key=`${row.client}\n${row.item_id}`;let session=open.get(key);
+   if(!session||row.time-session.lastTime>gapMs){session={id:digest(`${key}\n${row.time}`).slice(0,16),client:row.client,clientName:aliases.get(row.client)||'',service:row.service,itemId:row.item_id,title:row.title,product:row.product,version:row.version,kind:row.kind,firstTime:row.time,lastTime:row.time,bytes:0,hitBytes:0,requests:0,hitRequests:0,missRequests:0,recentBytes:0,events:[]};open.set(key,session);sessions.push(session);}
+   session.lastTime=row.time;session.bytes+=row.bytes||0;session.requests++;if(row.cache==='HIT'){session.hitBytes+=row.bytes||0;session.hitRequests++;}else session.missRequests++;
+   if(row.time>=now-10000)session.recentBytes+=row.bytes||0;
+   session.events.push({time:row.time,status:row.status,bytes:row.bytes,cache:row.cache});if(session.events.length>8)session.events.shift();
+  }
+  const result=sessions.sort((a,b)=>b.lastTime-a.lastTime).slice(0,30).map(s=>({...s,active:now-s.lastTime<=activeMs,rateBps:s.recentBytes/10,hitPercent:s.bytes?Math.round(s.hitBytes/s.bytes*1000)/10:0}));
+  const active=result.filter(s=>s.active);const activeBytes=active.reduce((n,s)=>n+s.bytes,0);
+  return {sessions:result,active:active.length,clients:new Set(active.map(s=>s.client)).size,rateBps:active.reduce((n,s)=>n+s.rateBps,0),hitPercent:activeBytes?Math.round(active.reduce((n,s)=>n+s.hitBytes,0)/activeBytes*1000)/10:0,windowMs,activeMs};
+ }
+ setClientAlias(client,name){
+  if(typeof client!=='string'||!client||client.length>128||!this.db.prepare('SELECT 1 ok FROM events WHERE client=? LIMIT 1').get(client))throw Error('Select a client observed in cache traffic');
+  if(typeof name!=='string'||name.length>80)throw Error('Device name must be at most 80 characters');name=name.trim();
+  if(!name)this.db.prepare('DELETE FROM client_aliases WHERE client=?').run(client);else this.db.prepare('INSERT INTO client_aliases VALUES(?,?) ON CONFLICT(client) DO UPDATE SET name=excluded.name').run(client,name);
+  return {client,name};
+ }
  summary(){
   const disk=this.db.prepare('SELECT COALESCE(SUM(size),0) bytes,COUNT(*) files FROM files').get();const totals=this.db.prepare('SELECT COALESCE(SUM(bytes_served),0) bytes,COALESCE(SUM(hit_bytes),0) hits,COALESCE(SUM(requests),0) requests FROM items').get();
   const services=this.db.prepare('SELECT service,SUM(bytes_served) bytes,SUM(hit_bytes) hits,SUM(requests) requests,COUNT(*) items FROM items GROUP BY service ORDER BY bytes DESC').all();
   const events=this.db.prepare('SELECT e.*,COALESCE(i.custom_title,i.title) title,i.version FROM events e JOIN items i ON i.id=e.item_id ORDER BY e.id DESC LIMIT 50').all();
   const chart=this.db.prepare('SELECT time,SUM(bytes) bytes,SUM(hits) hits FROM buckets WHERE time>? GROUP BY time ORDER BY time').all(Date.now()-15*60*1000);
   let space=null;try{const s=fs.statfsSync(this.cache);space={total:s.blocks*s.bsize,available:s.bavail*s.bsize};}catch{}
-  return {disk,totals,services,events,chart,space,index:this.scanState,logs:this.logState,jobs:this.jobs(),manifestCount:this.db.prepare('SELECT COUNT(*) n FROM manifests').get().n};
+  return {disk,totals,services,events,activity:this.activity(),chart,space,index:this.scanState,logs:this.logState,jobs:this.jobs(),manifestCount:this.db.prepare('SELECT COUNT(*) n FROM manifests').get().n};
  }
  rename(id,title){if(typeof title!=='string'||title.length>180)throw Error('Name must be at most 180 characters');this.db.prepare('UPDATE items SET custom_title=? WHERE id=?').run(title.trim()||null,id);}
  plan(ids,{mode='items',days=0}={}){

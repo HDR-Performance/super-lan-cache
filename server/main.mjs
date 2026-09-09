@@ -4,6 +4,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomBytes,randomUUID,scryptSync,timingSafeEqual} from 'node:crypto';
 import {isIP} from 'node:net';
+import {Resolver} from 'node:dns/promises';
 import {Store} from './store.mjs';
 import {Engine,atomic} from './engine.mjs';
 import {VERSION,digest,compileCatalog} from './model.mjs';
@@ -27,6 +28,7 @@ export function createApp(options={}){
 
  let integration=store.get('integration')||{enabled:false,instanceId:randomUUID(),tokenHash:null};store.set('integration',integration);
  const registryPath=path.join(base,'vendor/cache-domains');const registry=JSON.parse(fs.readFileSync(path.join(registryPath,'cache_domains.json'),'utf8'));const services=compileCatalog(registry,f=>fs.readFileSync(path.join(registryPath,f),'utf8'));const revision=digest(JSON.stringify(services));
+ const resolveDns=options.resolveDns||(async(server,domain,family)=>{const resolver=new Resolver({timeout:2500,tries:1});resolver.setServers([server]);try{return family===6?await resolver.resolve6(domain):await resolver.resolve4(domain);}finally{resolver.cancel();}});
  const sessions=new Map(),limits=new Map(),streams=new Set();let lastNetwork=null,telemetry={sampledAt:Date.now(),engine:{healthy:false,reason:'Checking engine'},network:null};let metricsBusy=false;let summaryCache=null,summaryAt=0;
  function audit(type,detail){const id=store.job(type);store.progress(id,'complete',detail);}
  function session(req){if(!auth.enabled)return {expires:Infinity};const key=req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith('lc_session='))?.slice(11);const s=sessions.get(key);return s&&s.expires>Date.now()?s:null;}
@@ -82,6 +84,7 @@ export function createApp(options={}){
      if(typeof b.password!=='string'||b.password.length<12||b.password.length>200)throw Error('Use a password between 12 and 200 characters');auth={enabled:true,salt:randomBytes(16).toString('hex'),mustChange:false};auth.hash=scryptSync(b.password,auth.salt,64).toString('hex');store.set('auth',auth);sessions.clear();audit('Password protection',{enabled:true});try{fs.unlinkSync(path.join(data,'initial-login.txt'));}catch{}return json(res,200,{ok:true,signInAgain:true});}
     if(route==='/api/index'){if(store.scanning||store.mutating)throw Error('Indexing or cleanup is already running');void store.scan();return json(res,202,{ok:true});}
     if(route==='/api/library/name'){store.rename(b.id,b.title);summaryAt=0;return json(res,200,{ok:true});}
+    if(route==='/api/clients/name'){const result=store.setClientAlias(b.client,b.name);summaryAt=0;audit('Device name',result);return json(res,200,result);}
     if(route==='/api/cleanup/preview')return json(res,200,store.plan(b.ids,{mode:b.mode,days:Math.max(0,Number(b.days)||0)}));
     if(route==='/api/cleanup/execute'){if(b.confirmation!=='DELETE')throw Error('Type DELETE to confirm the preview');const result=await store.execute(b.planId,engine);summaryAt=0;return json(res,202,result);}
     if(route==='/api/manifests/import'){const result=store.importManifests(b);audit('Manifest import',result);return json(res,200,result);}
@@ -98,6 +101,24 @@ export function createApp(options={}){
      const rules=new Map();for(const s of selected)for(const r of s.rules)rules.set(`${r.type}:${r.domain}`,r);
      const text=['# LanCache GUI generated dnsmasq configuration','# Review before installing in your independently managed DNS server.',...Array.from(rules.values()).flatMap(r=>r.type==='exact'?[`host-record=${r.domain},${b.address}`]:[`address=/*.${r.domain}/${b.address}`,`local=/*.${r.domain}/`])].join('\n')+'\n';
      return json(res,200,{filename:'lancache-dnsmasq.conf',content:text,revision,note:'Validate exact/wildcard semantics with your dnsmasq version. No DNS server was changed.'});
+    }
+    if(route==='/api/dns/validate'){
+     if(!isIP(b.address)||!isIP(b.dnsServer)||!Array.isArray(b.services)||b.services.length<1||b.services.length>services.length)throw Error('Choose a cache IP, DNS resolver IP, and at least one service');
+     const selected=services.filter(s=>b.services.includes(s.id));if(selected.length!==new Set(b.services).size)throw Error('One or more selected services are unknown');
+     const family=isIP(b.address),targets=selected.map(s=>{const rule=s.rules.find(r=>r.type==='exact')||s.rules[0];return {id:s.id,name:s.description,domain:rule?.type==='wildcard'?`lancache-test.${rule.domain}`:rule?.domain,originDomain:rule?.type==='wildcard'?`www.${rule.domain}`:rule?.domain};}).filter(x=>x.domain);
+     const routeResults=await Promise.all(targets.map(async target=>{try{const answers=await resolveDns(b.dnsServer,target.domain,family);return {...target,answers,ok:answers.includes(b.address)};}catch(e){return {...target,answers:[],ok:false,error:e.code||e.message};}}));
+     const reachable=routeResults.some(r=>r.answers.length);const routed=routeResults.filter(r=>r.ok).length;
+     const state=engine.state(),originServer=state.values?.UPSTREAM_DNS?.split(/[ ;]+/).map(x=>x.replace(/^\[|\]$/g,'')).find(isIP);let origin={ok:false,answers:[],server:originServer||'',error:''};
+     if(originServer&&targets[0])try{origin.answers=await resolveDns(originServer,targets[0].originDomain,family);origin.ok=origin.answers.length>0&&!origin.answers.includes(b.address);}catch(e){origin.error=e.code||e.message;}
+     const observed=new Set(store.activity().sessions.map(s=>s.service));const observedNames=selected.filter(s=>observed.has(s.id)).map(s=>s.description);
+     const checks=[
+      {id:'engine',label:'Cache engine',status:telemetry.engine.healthy?'pass':'fail',detail:telemetry.engine.healthy?'The managed cache engine is responding.':telemetry.engine.reason||'The cache engine is not ready.'},
+      {id:'resolver',label:'DNS resolver',status:reachable?'pass':'fail',detail:reachable?`${b.dnsServer} answered the selected service checks.`:`${b.dnsServer} did not return an address for the selected services.`},
+      {id:'routes',label:'Cache routes',status:routed===targets.length?'pass':routed?'warn':'fail',detail:`${routed} of ${targets.length} selected service domains resolve to ${b.address}.`,services:routeResults},
+      {id:'origin',label:'Origin resolver',status:origin.ok?'pass':'warn',detail:origin.ok?`${origin.server} resolves public origin addresses independently.`:'The configured origin resolver could not be confirmed. Cache downloads may fail on misses.',origin},
+      {id:'traffic',label:'Recent traffic',status:observedNames.length?'pass':'pending',detail:observedNames.length?`Recent cache traffic: ${observedNames.join(', ')}.`:'No selected-service traffic was seen in the last 30 minutes. Start a download after the route checks pass.'}
+     ];
+     return json(res,200,{checkedAt:Date.now(),address:b.address,dnsServer:b.dnsServer,checks,ready:checks.slice(0,4).every(c=>['pass','warn'].includes(c.status))&&routed===targets.length,note:'Read-only validation. No DNS settings were changed and no service was restarted.'});
     }
     if(route==='/api/backup'){store.db.exec('PRAGMA wal_checkpoint(PASSIVE)');const payload={version:VERSION,exportedAt:new Date().toISOString(),engine:engine.state(),names:store.db.prepare('SELECT id,custom_title FROM items WHERE custom_title IS NOT NULL').all(),manifests:store.versions(),integration:{enabled:integration.enabled,instanceId:integration.instanceId},jobs:store.jobs()};return json(res,200,payload,{'Content-Disposition':'attachment; filename="lancache-settings-export.json"'});}
     return json(res,404,{error:'Endpoint not found'});
