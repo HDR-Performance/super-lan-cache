@@ -3,8 +3,9 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {randomUUID} from 'node:crypto';
-import {parseKey,parseLog,digest} from './model.mjs';
+import {parseKey,parseLog,parseStreamLog,digest} from './model.mjs';
 const pause=()=>new Promise(r=>setTimeout(r,1));
+const LOG_INGEST_BYTES=256*1024;
 async function readKey(handle,hash){for(const size of [4096,65536]){const b=Buffer.alloc(size);const {bytesRead}=await handle.read(b,0,size,0);const info=parseKey(b.subarray(0,bytesRead),hash);if(info||bytesRead<size)return info;}return null;}
 export class Store{
  constructor(data,cache,logs){
@@ -16,6 +17,8 @@ export class Store{
    CREATE INDEX IF NOT EXISTS files_item ON files(item_id);
    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,time INTEGER,service TEXT,client TEXT,item_id TEXT,status INTEGER,bytes INTEGER,cache TEXT);
    CREATE INDEX IF NOT EXISTS events_time ON events(time);
+   CREATE TABLE IF NOT EXISTS stream_events(id INTEGER PRIMARY KEY,time INTEGER,service TEXT,client TEXT,server TEXT,status INTEGER,bytes_sent INTEGER,bytes_received INTEGER,duration REAL);
+   CREATE INDEX IF NOT EXISTS stream_events_time ON stream_events(time);
    CREATE TABLE IF NOT EXISTS client_aliases(client TEXT PRIMARY KEY,name TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS buckets(time INTEGER,service TEXT,bytes INTEGER,hits INTEGER,requests INTEGER,PRIMARY KEY(time,service));
    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,type TEXT,state TEXT,created INTEGER,updated INTEGER,details TEXT);
@@ -23,8 +26,14 @@ export class Store{
    CREATE TABLE IF NOT EXISTS manifests(id TEXT PRIMARY KEY,title TEXT,version TEXT,retained INTEGER,source TEXT,complete INTEGER);
   `);
   this.db.prepare("UPDATE jobs SET state='interrupted' WHERE state IN ('running','queued')").run();
-  this.scanState=this.get('scan')||{state:'not_started',files:0};this.logState=this.get('logState')||{offset:0,inode:null,records:0};
-  this.scanning=false;this.logBusy=false;this.mutating=false;this.closed=false;this.inventoryDirty=false;
+  this.scanState=this.get('scan')||{state:'not_started',files:0};this.logState=this.get('logState')||{offset:0,inode:null,records:0};this.streamLogState=this.get('streamLogState')||{offset:0,inode:null,records:0};
+  if(['running','interrupted'].includes(this.scanState.state)){
+   const prior=this.db.prepare("SELECT details FROM jobs WHERE type='index' AND state='complete' ORDER BY updated DESC LIMIT 1").get();
+   if(prior){try{this.scanState={...JSON.parse(prior.details),recoveredAfterInterruption:true};}catch{this.scanState={...this.scanState,state:'interrupted',interruptedAt:Date.now()};}}
+   else this.scanState={...this.scanState,state:'interrupted',interruptedAt:Date.now()};
+   this.set('scan',this.scanState);
+  }
+  this.scanning=false;this.logBusy=false;this.streamLogBusy=false;this.mutating=false;this.closed=false;this.inventoryDirty=false;this.inventoryDirtyAt=0;
   this.getIndexedFile=this.db.prepare('SELECT size,mtime,inode,key FROM files WHERE hash=?');
   this.putItem=this.db.prepare('INSERT OR IGNORE INTO items(id,service,product,version,kind,title,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?)');
   this.putFile=this.db.prepare('INSERT INTO files(hash,relative,item_id,size,mtime,inode,key,generation) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO UPDATE SET relative=excluded.relative,item_id=excluded.item_id,size=excluded.size,mtime=excluded.mtime,inode=excluded.inode,key=excluded.key,generation=excluded.generation');
@@ -69,19 +78,33 @@ export class Store{
    handle=await fsp.open(path.join(this.logs,'access.log'),'r');const st=await handle.stat();
    let state={...this.logState};const inode=String(st.ino);if(state.inode!==inode||st.size<state.offset){if(state.inode)state.rotationNotice='Log rotated/truncated; reading the new file. Any unread old tail may be absent.';state.offset=0;state.inode=inode;}
    if(state.offset>=st.size){state.totalBytes=st.size;state.caughtUp=true;this.logState=state;return;}
-   const buffer=Buffer.alloc(Math.min(2*1024*1024,st.size-state.offset));const {bytesRead}=await handle.read(buffer,0,buffer.length,state.offset);const end=buffer.subarray(0,bytesRead).lastIndexOf(10);
-   if(end<0){if(bytesRead===buffer.length&&bytesRead===2*1024*1024){state.offset+=bytesRead;state.rejected=(state.rejected||0)+1;}else return;}
+   // Keep each synchronous SQLite transaction short so live API requests remain
+   // responsive while a busy client appends thousands of cache range records.
+   const buffer=Buffer.alloc(Math.min(LOG_INGEST_BYTES,st.size-state.offset));const {bytesRead}=await handle.read(buffer,0,buffer.length,state.offset);const end=buffer.subarray(0,bytesRead).lastIndexOf(10);
+   if(end<0){if(bytesRead===buffer.length&&bytesRead===LOG_INGEST_BYTES){state.offset+=bytesRead;state.rejected=(state.rejected||0)+1;}else return;}
    const rows=end>=0?buffer.subarray(0,end).toString('utf8').split('\n'):[];
    const event=this.db.prepare('INSERT INTO events(time,service,client,item_id,status,bytes,cache) VALUES(?,?,?,?,?,?,?)');
    const update=this.db.prepare('UPDATE items SET first_seen=CASE WHEN first_seen=0 OR first_seen>? THEN ? ELSE first_seen END,last_seen=MAX(last_seen,?),bytes_served=bytes_served+?,hit_bytes=hit_bytes+?,requests=requests+1 WHERE id=?');
    const bucket=this.db.prepare('INSERT INTO buckets VALUES(?,?,?,?,?) ON CONFLICT(time,service) DO UPDATE SET bytes=bytes+excluded.bytes,hits=hits+excluded.hits,requests=requests+1');
    this.db.exec('BEGIN');try{
-    for(const line of rows){const r=parseLog(line);if(!r)continue;if(['MISS','EXPIRED','UPDATING','REVALIDATED'].includes(r.cache)&&[200,206].includes(r.status))this.inventoryDirty=true;this.item(r.item,r.time);const hit=r.cache==='HIT'?r.bytes:0;event.run(r.time,r.service,r.client,r.item.id,r.status,r.bytes,r.cache);update.run(r.time,r.time,r.time,r.bytes,hit,r.item.id);bucket.run(Math.floor(r.time/10000)*10000,r.service,r.bytes,hit,1);state.records++;}
+    for(const line of rows){const r=parseLog(line);if(!r)continue;if(['MISS','EXPIRED','UPDATING','REVALIDATED'].includes(r.cache)&&[200,206].includes(r.status)){this.inventoryDirty=true;this.inventoryDirtyAt=Date.now();}this.item(r.item,r.time);const hit=r.cache==='HIT'?r.bytes:0;event.run(r.time,r.service,r.client,r.item.id,r.status,r.bytes,r.cache);update.run(r.time,r.time,r.time,r.bytes,hit,r.item.id);bucket.run(Math.floor(r.time/10000)*10000,r.service,r.bytes,hit,1);state.records++;}
     if(end>=0)state.offset+=end+1;state.totalBytes=st.size;state.caughtUp=state.offset>=st.size-1;state.updatedAt=Date.now();state.error=null;this.set('logState',state);
     this.db.prepare('DELETE FROM events WHERE id < (SELECT MAX(id)-20000 FROM events)').run();
     this.db.prepare('DELETE FROM buckets WHERE time<?').run(Date.now()-30*86400000);this.db.exec('COMMIT');this.logState=state;
    }catch(e){this.db.exec('ROLLBACK');throw e;}
   }catch(e){this.logState.error=e.message;}finally{await handle?.close();this.logBusy=false;}
+ }
+ async ingestStream(){
+  if(this.streamLogBusy||this.closed)return;this.streamLogBusy=true;
+  let handle;try{
+   handle=await fsp.open(path.join(this.logs,'stream-access.log'),'r');const st=await handle.stat();let state={...this.streamLogState};const inode=String(st.ino);
+   if(state.inode!==inode||st.size<state.offset){if(state.inode)state.rotationNotice='Stream log rotated or was truncated; reading the new file.';state.offset=0;state.inode=inode;}
+   if(state.offset>=st.size){state.totalBytes=st.size;state.caughtUp=true;this.streamLogState=state;return;}
+   const buffer=Buffer.alloc(Math.min(LOG_INGEST_BYTES,st.size-state.offset));const {bytesRead}=await handle.read(buffer,0,buffer.length,state.offset);const end=buffer.subarray(0,bytesRead).lastIndexOf(10);
+   if(end<0){if(bytesRead===buffer.length&&bytesRead===LOG_INGEST_BYTES){state.offset+=bytesRead;state.rejected=(state.rejected||0)+1;}else return;}
+   const rows=end>=0?buffer.subarray(0,end).toString('utf8').split('\n'):[],event=this.db.prepare('INSERT INTO stream_events(time,service,client,server,status,bytes_sent,bytes_received,duration) VALUES(?,?,?,?,?,?,?,?)');
+   this.db.exec('BEGIN');try{for(const line of rows){const r=parseStreamLog(line);if(!r)continue;event.run(r.time,r.service,r.client,r.server,r.status,r.bytesSent,r.bytesReceived,r.duration);state.records++;}if(end>=0)state.offset+=end+1;state.totalBytes=st.size;state.caughtUp=state.offset>=st.size-1;state.updatedAt=Date.now();state.error=null;this.set('streamLogState',state);this.db.prepare('DELETE FROM stream_events WHERE id < (SELECT MAX(id)-20000 FROM stream_events)').run();this.db.prepare('DELETE FROM stream_events WHERE time<?').run(Date.now()-30*86400000);this.db.exec('COMMIT');this.streamLogState=state;}catch(e){this.db.exec('ROLLBACK');throw e;}
+  }catch(e){if(e.code!=='ENOENT')this.streamLogState.error=e.message;}finally{await handle?.close();this.streamLogBusy=false;}
  }
  library({q='',service='',offset=0}={}){
   const where='WHERE (?=\'\' OR i.service=?) AND (?=\'\' OR COALESCE(i.custom_title,i.title) LIKE ? OR i.product LIKE ?)';const args=[service,service,q,`%${q}%`,`%${q}%`];
@@ -102,11 +125,25 @@ export class Store{
   const active=result.filter(s=>s.active);const activeBytes=active.reduce((n,s)=>n+s.bytes,0);
   return {sessions:result,active:active.length,clients:new Set(active.map(s=>s.client)).size,rateBps:active.reduce((n,s)=>n+s.rateBps,0),hitPercent:activeBytes?Math.round(active.reduce((n,s)=>n+s.hitBytes,0)/activeBytes*1000)/10:0,windowMs,activeMs};
  }
+ passthrough({windowMs=30*60000,gapMs=120000,now=Date.now()}={}){
+  const rows=this.db.prepare('SELECT * FROM stream_events WHERE time>? ORDER BY time,id').all(now-windowMs),aliases=new Map(this.db.prepare('SELECT client,name FROM client_aliases').all().map(r=>[r.client,r.name])),open=new Map(),sessions=[];
+  for(const row of rows){const key=`${row.client}\n${row.server}`;let session=open.get(key),startedAt=row.time-row.duration*1000;if(!session||row.time-session.lastTime>gapMs){session={id:digest(`${key}\n${row.time}`).slice(0,16),client:row.client,clientName:aliases.get(row.client)||'',service:row.service,server:row.server,status:row.status,firstTime:row.time,startedAt,lastTime:row.time,bytes:0,receivedBytes:0,connectionSeconds:0,connections:0};open.set(key,session);sessions.push(session);}session.startedAt=Math.min(session.startedAt,startedAt);session.lastTime=Math.max(session.lastTime,row.time);session.status=row.status;session.bytes+=row.bytes_sent||0;session.receivedBytes+=row.bytes_received||0;session.connectionSeconds+=row.duration||0;session.connections++;}
+  const result=sessions.sort((a,b)=>b.lastTime-a.lastTime).slice(0,30).map(s=>{const duration=Math.max(0,(s.lastTime-s.startedAt)/1000);return {...s,duration,rateBps:s.bytes/Math.max(1,duration),cacheStatus:'Not cached'};});return {sessions:result,bytes:result.reduce((n,s)=>n+s.bytes,0),clients:new Set(result.map(s=>s.client)).size,windowMs,note:'Completed encrypted HTTPS sessions; routed through this server and not stored in the cache.'};
+ }
  setClientAlias(client,name){
   if(typeof client!=='string'||!client||client.length>128||!this.db.prepare('SELECT 1 ok FROM events WHERE client=? LIMIT 1').get(client))throw Error('Select a client observed in cache traffic');
   if(typeof name!=='string'||name.length>80)throw Error('Device name must be at most 80 characters');name=name.trim();
   if(!name)this.db.prepare('DELETE FROM client_aliases WHERE client=?').run(client);else this.db.prepare('INSERT INTO client_aliases VALUES(?,?) ON CONFLICT(client) DO UPDATE SET name=excluded.name').run(client,name);
   return {client,name};
+ }
+ // A brand-new install needs its first inventory. Interrupted or failed scans
+ // are retried by the idle-time scheduler after engine activity is known.
+ shouldStartupScan(){return this.scanState.state==='not_started';}
+ shouldAutoScan(engineState,now=Date.now()){
+  if(this.scanning||this.mutating||!this.logState.caughtUp||!engineState?.healthy||!engineState.connections)return false;const active=(engineState.connections.reading||0)+(engineState.connections.writing||0)>0;if(active)return false;
+  const settledMiss=this.inventoryDirty&&this.inventoryDirtyAt>0&&now-this.inventoryDirtyAt>5*60000;
+  const incomplete=this.scanState.state!=='complete'&&now-(this.scanState.interruptedAt||this.scanState.completedAt||this.scanState.startedAt||now)>30*60000;
+  const periodic=this.scanState.state==='complete'&&now-(this.scanState.completedAt||0)>24*60*60000;return settledMiss||incomplete||periodic;
  }
  summary(){
   const disk=this.db.prepare('SELECT COALESCE(SUM(size),0) bytes,COUNT(*) files FROM files').get();const totals=this.db.prepare('SELECT COALESCE(SUM(bytes_served),0) bytes,COALESCE(SUM(hit_bytes),0) hits,COALESCE(SUM(requests),0) requests FROM items').get();
@@ -114,7 +151,7 @@ export class Store{
   const events=this.db.prepare('SELECT e.*,COALESCE(i.custom_title,i.title) title,i.version FROM events e JOIN items i ON i.id=e.item_id ORDER BY e.id DESC LIMIT 50').all();
   const chart=this.db.prepare('SELECT time,SUM(bytes) bytes,SUM(hits) hits FROM buckets WHERE time>? GROUP BY time ORDER BY time').all(Date.now()-15*60*1000);
   let space=null;try{const s=fs.statfsSync(this.cache);space={total:s.blocks*s.bsize,available:s.bavail*s.bsize};}catch{}
-  return {disk,totals,services,events,activity:this.activity(),chart,space,index:this.scanState,logs:this.logState,jobs:this.jobs(),manifestCount:this.db.prepare('SELECT COUNT(*) n FROM manifests').get().n};
+  return {disk,totals,services,events,activity:this.activity(),passthrough:this.passthrough(),chart,space,index:this.scanState,logs:this.logState,streamLogs:this.streamLogState,jobs:this.jobs(),manifestCount:this.db.prepare('SELECT COUNT(*) n FROM manifests').get().n};
  }
  rename(id,title){if(typeof title!=='string'||title.length>180)throw Error('Name must be at most 180 characters');this.db.prepare('UPDATE items SET custom_title=? WHERE id=?').run(title.trim()||null,id);}
  plan(ids,{mode='items',days=0}={}){

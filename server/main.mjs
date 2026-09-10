@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {randomBytes,randomUUID,scryptSync,timingSafeEqual} from 'node:crypto';
 import {isIP} from 'node:net';
 import {Resolver} from 'node:dns/promises';
+import {availableParallelism} from 'node:os';
 import {Store} from './store.mjs';
 import {Engine,atomic} from './engine.mjs';
 import {VERSION,digest,compileCatalog} from './model.mjs';
@@ -35,7 +36,8 @@ export function createApp(options={}){
  function equal(a,b){try{const x=Buffer.from(a,'hex'),y=Buffer.from(b,'hex');return x.length===y.length&&timingSafeEqual(x,y);}catch{return false;}}
  async function body(req){let size=0;const buffers=[];for await(const b of req){size+=b.length;if(size>8*1024*1024)throw Error('Request exceeds 8 MB');buffers.push(b);}try{return JSON.parse(Buffer.concat(buffers).toString()||'{}');}catch{throw Error('Invalid JSON');}}
  function json(res,status,value,headers={}){res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(value));}
- function snapshot(){if(Date.now()-summaryAt>5000||!summaryCache){summaryCache=store.summary();summaryAt=Date.now();}return {...summaryCache,...telemetry,version:VERSION,settings:engine.state(),metadata:store.get('steamMetadata'),integration:{enabled:integration.enabled,paired:!!integration.tokenHash},passwordRequired:auth.enabled,standalone:true};}
+ function runtimeResources(){let memoryLimit=null,memoryCurrent=null;try{const value=fs.readFileSync('/sys/fs/cgroup/memory.max','utf8').trim();memoryLimit=value==='max'?null:Number(value);memoryCurrent=Number(fs.readFileSync('/sys/fs/cgroup/memory.current','utf8').trim());}catch{}return {availableCpus:availableParallelism(),memoryLimit:Number.isFinite(memoryLimit)?memoryLimit:null,memoryCurrent:Number.isFinite(memoryCurrent)?memoryCurrent:null,resourceAuthority:'Container CPU and memory limits are configured by the host deployment.'};}
+ function snapshot(){if(Date.now()-summaryAt>5000||!summaryCache){summaryCache=store.summary();summaryAt=Date.now();}return {...summaryCache,...telemetry,version:VERSION,settings:engine.state(),resources:runtimeResources(),metadata:store.get('steamMetadata'),integration:{enabled:integration.enabled,paired:!!integration.tokenHash},passwordRequired:auth.enabled,standalone:true};}
  async function metrics(){if(metricsBusy)return;metricsBusy=true;try{const health=await engine.status();let network=null;try{const lines=fs.readFileSync('/proc/net/dev','utf8').split('\n').filter(x=>/^\s*(eth|en)/.test(x));let rx=0,tx=0;for(const line of lines){const n=line.split(':')[1].trim().split(/\s+/).map(Number);rx+=n[0];tx+=n[8];}const now=Date.now();if(lastNetwork&&now>lastNetwork.time)network={receiveBps:Math.max(0,(rx-lastNetwork.rx)*1000/(now-lastNetwork.time)),sendBps:Math.max(0,(tx-lastNetwork.tx)*1000/(now-lastNetwork.time)),label:'Container network traffic (includes upstream and clients)'};lastNetwork={time:now,rx,tx};}catch{}
   telemetry={sampledAt:Date.now(),engine:health,network};if(streams.size){const packet=`data: ${JSON.stringify(snapshot())}\n\n`;for(const res of streams){if(!session(res.authRequest)||res.writableLength>1024*1024){res.end();streams.delete(res);}else res.write(packet);}}
  }finally{metricsBusy=false;}}
@@ -130,7 +132,7 @@ export function createApp(options={}){
  });
  server.requestTimeout=30000;server.headersTimeout=10000;server.keepAliveTimeout=5000;
  const timers=[];
- function startWorkers(){timers.push(setInterval(()=>void store.ingest(),250),setInterval(()=>void metrics(),2000),setInterval(()=>{const age=Date.now()-(store.scanState.completedAt||Date.now());if(!store.scanning&&!store.mutating&&!engine.busy&&store.logState.caughtUp&&age>30000&&(store.inventoryDirty||age>1800000)){store.inventoryDirty=false;void store.scan();}},10000),setInterval(()=>{for(const[k,v]of sessions)if(v.expires<Date.now())sessions.delete(k);for(const[k,v]of limits)if(v.until<Date.now())limits.delete(k);},60000));void metrics();void store.scan();}
+ function startWorkers(){timers.push(setInterval(()=>void store.ingest(),250),setInterval(()=>void store.ingestStream(),1000),setInterval(()=>void metrics(),2000),setInterval(()=>{if(!engine.busy&&store.shouldAutoScan(telemetry.engine)){store.inventoryDirty=false;void store.scan();}},10000),setInterval(()=>{for(const[k,v]of sessions)if(v.expires<Date.now())sessions.delete(k);for(const[k,v]of limits)if(v.until<Date.now())limits.delete(k);},60000));void store.ingestStream();void metrics();if(store.shouldStartupScan())void store.scan();}
  async function stop(){timers.forEach(clearInterval);for(const res of streams)res.end();store.closed=true;while(store.scanning||store.logBusy)await new Promise(r=>setTimeout(r,20));await new Promise(r=>server.close(r));store.close();}
  return {server,store,engine,startWorkers,stop};
 }

@@ -53,6 +53,13 @@ export function parseLog(line){
  if(!Number.isFinite(row.time)||!Number.isFinite(row.bytes)||row.bytes<0||typeof row.path!=='string'||typeof row.service!=='string'||row.path==='/lancache-heartbeat')return null;
  row.item=identify(row.service,row.path);return row;
 }
+export function parseStreamLog(line){
+ const m=line.match(/^(\S+) \[([^\]]+)\] (\S+) (\d+) (\S+) (\d+) (\d+) ([\d.]+)$/);if(!m)return null;
+ const row={client:m[1],time:Date.parse(m[2].replace(/^(\d+)\/(\w+)\/(\d+):/,'$2 $1 $3 ')),protocol:m[3],status:Number(m[4]),server:m[5],bytesSent:Number(m[6]),bytesReceived:Number(m[7]),duration:Number(m[8])};
+ if(!Number.isFinite(row.time)||!Number.isFinite(row.status)||!Number.isFinite(row.bytesSent)||!Number.isFinite(row.bytesReceived)||!Number.isFinite(row.duration)||row.duration<0||row.bytesSent<0||row.bytesReceived<0)return null;
+ const host=row.server.toLowerCase();row.service=host.includes('epicgames')||host.includes('unrealengine')||host.includes('fastly-edge')?'epicgames':host.includes('xboxlive')||host.includes('microsoft')||host.includes('windowsupdate')?'xboxlive':host.includes('steam')?'steam':host.includes('blizzard')||host.includes('battle.net')?'blizzard':host.includes('riot')?'riot':host.includes('ubisoft')?'ubisoft':host.includes('ea.com')||host.includes('origin')?'origin':'https';
+ return row;
+}
 export function compileCatalog(registry,readFile){
  return registry.cache_domains.map(s=>({id:s.name,description:s.description,rules:[...new Set(s.domain_files.flatMap(f=>readFile(f).split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'))))].filter(x=>/^(\*\.)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(x)).map(x=>({type:x.startsWith('*.')?'wildcard':'exact',domain:x.replace(/^\*\./,'')}))}));
 }
