@@ -4,7 +4,7 @@
 
 [Download & install](https://github.com/HDR-Performance/super-lan-cache/releases) · [TrueNAS guide](docs/TRUENAS.md) · [Super Pi Hole](https://github.com/HDR-Performance/super-pi-hole)
 
-An all-in-one LanCache engine, management API, and web interface. One container and one TrueNAS app. Super Pi Hole is optional and is never required for startup, authentication, storage, caching, or maintenance.
+An all-in-one LanCache engine, optional built-in DNS service, management API, and web interface. It installs as one TrueNAS app. Super Pi Hole is optional and is never required for startup, authentication, storage, caching, DNS, or maintenance.
 
 ## Features
 
@@ -15,6 +15,7 @@ An all-in-one LanCache engine, management API, and web interface. One container 
 - Steam depot IDs, optional community Steam title lookup, Xbox package versions when exposed in URLs, publisher/service groups, custom display names, and search.
 - Selected cache removal has an expiring preview, explicit confirmation, path/key/inode/size checks, protected manifest references, idle-engine checking, graceful NGINX stop, restart, and an operation record.
 - Real engine settings: disk allowance, index memory, minimum free disk, retention/validity, origin DNS resolvers, and worker count. Settings are validated with `nginx -t`, persist under the manager volume, and roll back after failure.
+- Optional built-in dnsmasq service with port-conflict reporting, independent upstream validation, presets, status, and router DHCP guidance.
 - Independent dnsmasq rule export and optional scoped, revocable Super Pi Hole pairing.
 
 ## Content identity and versions
@@ -25,13 +26,33 @@ The library supports manual deletion of selected content groups. Exclusive versi
 
 Steam name refresh downloads the public `regix1/lancache-pics` mapping. It does not upload the library, download games, or establish version ownership. Its source, timestamp, and digest are recorded.
 
-## Standalone installation
+## Fresh installation
+
+### TrueNAS SCALE
+
+1. Open the [releases page](https://github.com/HDR-Performance/super-lan-cache/releases), choose the highest version, and download `super-lan-cache-truenas.yaml`. The release asset pins the exact image digest that passed the release tests.
+2. Follow the [TrueNAS fresh-install steps](docs/TRUENAS.md#fresh-truenas-install). Set the server IP, dataset paths and cache allowance before installing the YAML as `super-lan-cache`.
+3. Open **Web UI** from Installed Applications. A fresh installation has no password. Enable one later under Settings → Password protection if wanted.
+4. Open **Services & DNS** and choose one DNS path. Built-in DNS is the standalone option; leave it off when Super Pi Hole, Pi-hole, AdGuard Home or another resolver already owns port 53.
+
+### Docker Compose
 
 1. Copy `.env.example` to `.env` and set your LAN address. Review storage in `compose.yaml`.
 2. Run `docker compose up -d` using the published image, or build from source with `docker compose -f compose.yaml -f compose.build.yaml up -d --build`.
 3. New installations open without a password. Set one later under Settings → Password protection, or explicitly supply `GUI_INITIAL_PASSWORD` on first startup to require login immediately. Existing saved passwords remain enabled after upgrades.
 4. Open the configured `GUI_PUBLIC_ORIGIN`. Settings includes controls to enable, change, or turn off password protection. In no-login mode, anyone who can reach that management address can use its controls.
-5. Configure a separate DNS server for the selected cache domains. The engine's origin resolver must resolve the actual Internet servers, not route back to the cache.
+5. Choose one DNS path under **Services & DNS**. For the simplest standalone setup, enable **Built-in DNS** and set your router's DHCP DNS server to the cache server address. If Super Pi Hole, Pi-hole, AdGuard Home, or another resolver already uses port 53, leave built-in DNS off and use the integration or exported rules instead.
+
+## Update an existing Super Lan-Cache installation
+
+The 0.1.4 update keeps the existing cache format, library database, settings and optional password. It adds a second `lancache-dns` container to the same app; that container starts with built-in DNS disabled.
+
+- **TrueNAS:** save the current app YAML and snapshot the manager dataset. Download the new release YAML, copy in the same server IP, cache allowance and existing cache/log/manager dataset paths, then replace the YAML in the existing app's **Edit** screen. Keep the same app name and storage paths. See the [exact upgrade checklist](docs/TRUENAS.md#upgrade-an-existing-super-lan-cache-app).
+- **Docker Compose:** from the same project directory, preserve `.env` and the existing volumes, update `compose.yaml`, then run `docker compose pull && docker compose up -d`. Do not change the Compose project name or volume mappings.
+- After the update, confirm both `lancache` and `lancache-dns` containers are running, open `/healthz`, and let the existing inventory resume. No cache copy, deletion or forced full rebuild is required.
+- If another DNS product is already active, keep built-in DNS disabled. The cache engine and GUI remain fully functional without it.
+
+Built-in DNS runs in a bundled sidecar and starts disabled. Enabling it does not stop or reconfigure any other resolver. If port 53 is occupied, the GUI reports the conflict and keeps the sidecar offline. Its upstream resolvers must be independent public or LAN DNS addresses; the cache server address and loopback are rejected to prevent a DNS loop. Disabling the sidecar does not stop caching, remove cache files, or disable the web interface.
 
 Only HTTP(S) management origins are supported. The configured host is required by the rebinding guard. To use HTTPS, configure an appropriate trusted reverse proxy and set the public origin accordingly.
 
@@ -41,7 +62,7 @@ Persistent mounts:
 |---|---|
 | `/data/cache` | Existing NGINX cache, `CONFIGHASH`, chunk directory |
 | `/data/logs` | HTTP/SNI logs |
-| `/data/manager` | SQLite inventory/history, password hash, integration state, persistent engine settings |
+| `/data/manager` | SQLite inventory/history, password hash, integration state, persistent engine and built-in DNS settings |
 
 The container controls its own NGINX through a root-only supervisor socket. It does not mount the Docker socket or use NAS administrator/SSH credentials. The supervisor socket does not listen on TCP.
 
@@ -65,6 +86,6 @@ Bearer endpoints: `/api/integrations/v1/identity`, `/status`, `/services`. Ident
 
 Requires Node 24. No npm dependencies are required. Run `npm run check` and `npm test`. Running without `GUI_MANAGED=true` provides a local interface with engine control and deletion disabled.
 
-Validation covers cache-key/header parsing, history restart deduplication, inventory reconciliation, protected/shared references, verified deletion, tampered paths and files, authentication/CSRF, pairing schemas/revocation, settings rollback, and active-download guards. TrueNAS validation additionally exercises real NGINX MISS/HIT transfers, indexing, deletion/refetch, saved settings across redeploy, and browser settings controls.
+Validation covers cache-key/header parsing, history restart deduplication, inventory reconciliation, protected/shared references, verified deletion, tampered paths and files, authentication/CSRF, pairing schemas/revocation, built-in DNS configuration and rule rendering, settings rollback, and active-download guards. TrueNAS validation additionally exercises real DNS answers on an isolated high port, NGINX MISS/HIT transfers, indexing, deletion/refetch, saved settings across redeploy, and browser settings controls.
 
 Upstream monolithic source is vendored at `b9213a93cd2190fec920d5b087d067360aebc0c8`; cache-domains at `170c0905e4d5230833a1854b896299c743c3059e`. Release images and installation assets record an immutable image digest; base-image updates require a new tested build. Upstream licenses remain with their vendored files. No code from the separately researched AGPL LanCache Manager was incorporated.

@@ -1,10 +1,26 @@
 # Super Lan-Cache on TrueNAS
 
-1. Download `super-lan-cache-truenas.yaml` from the [release](https://github.com/HDR-Performance/super-lan-cache/releases). The release file pins the tested image digest. The source template is `deploy/truenas.yaml`.
+## Fresh TrueNAS install
+
+1. Download `super-lan-cache-truenas.yaml` from the highest version on the [releases page](https://github.com/HDR-Performance/super-lan-cache/releases). Do not copy the source template for a normal install: the release file pins the tested image digest.
 2. Create cache, logs and manager datasets. Replace the example `/mnt/tank/apps/super-lan-cache` paths and every `192.168.1.10` with your server address. Choose your cache allowance. New named datasets should be writable by the container; the entrypoint initializes ownership for the engine.
 3. Ensure TCP 80 and 443 are free on the selected address, and move the TrueNAS administration UI to other ports if it currently owns them. Management uses TCP 20722. Do not remap content ports to arbitrary ports: download clients use standard HTTP/HTTPS ports. Expose the management port only to your trusted LAN.
 4. Install via YAML with name `super-lan-cache`. Open **Web UI**. There is no default password. Settings can enable, change or disable password protection later.
-5. Use Services & DNS to export rules for your own resolver, or pair optionally with [Super Pi Hole](https://github.com/HDR-Performance/super-pi-hole). Clients must use that DNS server. Engine origin resolvers must resolve real Internet addresses, so keep them separate from cache-routing DNS.
+5. Choose one DNS path under **Services & DNS**. Enable built-in DNS for a standalone setup, export rules for your own resolver, or pair optionally with [Super Pi Hole](https://github.com/HDR-Performance/super-pi-hole). Clients must use that DNS server. Engine origin resolvers must resolve real Internet addresses, so keep them separate from cache-routing DNS.
+
+The built-in DNS sidecar starts disabled and uses host networking so it can bind the server's LAN address directly. If port 53 is already used, the GUI reports a conflict and the sidecar stays offline; it never stops the existing resolver. On a server already running Super Pi Hole, Pi-hole, AdGuard Home, or another DNS service, keep built-in DNS disabled. On a standalone server, enable it only after the GUI shows the correct listen address and independent upstream resolvers, then set the router's DHCP DNS server to that address.
+
+## Upgrade an existing Super Lan-Cache app
+
+These steps update an existing 0.1.x installation in place and preserve its cache, history, settings and password.
+
+1. In TrueNAS, save a copy of the existing app YAML. Snapshot the manager dataset; snapshot the cache dataset too if space and snapshot policy permit.
+2. Download `super-lan-cache-truenas.yaml` from the new release. Edit all three dataset source paths to match the existing app. Copy the existing server IP into both `GUI_CACHE_IP` entries, `GUI_PUBLIC_ORIGIN`, and the `x-portals` host. Retain the existing cache allowance, index memory, free-space reserve, retention and upstream resolver values.
+3. Open the installed app's **Edit** screen and replace its YAML with the prepared release definition. Keep the same app name and the same cache, logs and manager paths. Applying the edit recreates the containers but does not delete those datasets.
+4. Wait for the app to report Running. It now contains `lancache` and `lancache-dns`. Open **Web UI** and verify `/healthz` reports healthy. The library scan resumes against the existing files; no cache migration or deletion is required.
+5. Built-in DNS remains disabled after the upgrade. Leave it disabled when Super Pi Hole or another resolver owns port 53. Enable it from **Services & DNS** only when this server will become the LAN DNS endpoint.
+
+If the current app is the original upstream `lancachenet/monolithic` container rather than Super Lan-Cache, follow **Reusing an existing LanCache** below. Preserve the old app until Super Lan-Cache has scanned the mounted cache and served a verified test download; never run both engines against the same dataset at the same time.
 
 ## Reusing an existing LanCache
 
@@ -14,7 +30,7 @@ Inventory runs automatically. Large caches can take hours; indexed bytes remain 
 
 ## Updates and rollback
 
-Pull the next version before a maintenance window; snapshot manager/cache configuration and retain the previous image digest. Change the image in your existing app definition and keep all mounts. TrueNAS may recreate containers during app updates. Roll back the definition to the previous image and restore the manager snapshot if a future release changes its schema. Never delete datasets during an image rollback.
+Use the installer attached to the release so both services use the tested immutable image digest. Update during a maintenance window; snapshot manager/cache configuration and retain the prior app YAML. TrueNAS may recreate containers during app updates. To roll back, restore the previous YAML/image digest and restore the manager snapshot only if required. Never delete datasets during an image rollback.
 
 ## Current TrueNAS installation model
 

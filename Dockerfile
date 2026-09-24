@@ -5,7 +5,7 @@ LABEL description="Super Lan-Cache: integrated game cache engine, live dashboard
 LABEL org.opencontainers.image.source="https://github.com/HDR-Performance/super-lan-cache"
 
 RUN	apt-get update							;\
-	apt-get install -y jq git libstdc++6				;
+	apt-get install -y jq git libstdc++6 dnsmasq			;
 
 ENV GENERICCACHE_VERSION=2 \
     CACHE_MODE=monolithic \
@@ -70,4 +70,4 @@ RUN find /hooks /scripts -type f -name '*.sh' -exec sed -i 's/\r$//' {} + && \
 ENV GUI_MANAGED=true GUI_PORT=20722 GUI_DATA=/data/manager NOFETCH=true
 EXPOSE 20722
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 CMD /scripts/gui-healthcheck.sh
-LABEL org.opencontainers.image.title="Super Lan-Cache" org.opencontainers.image.version="0.1.3"
+LABEL org.opencontainers.image.title="Super Lan-Cache" org.opencontainers.image.version="0.1.4"

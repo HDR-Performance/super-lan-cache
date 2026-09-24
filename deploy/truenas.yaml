@@ -2,7 +2,7 @@
 # Existing caches: mount the folder containing CONFIGHASH and cache/, not cache/ itself.
 services:
   lancache:
-    image: ghcr.io/hdr-performance/super-lan-cache:0.1.3
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.4
     platform: linux/amd64
     restart: unless-stopped
     ports: ["80:80", "443:443", "20722:20722"]
@@ -28,6 +28,31 @@ services:
         source: /mnt/tank/apps/super-lan-cache/manager
         target: /data/manager
         bind: {create_host_path: false}
+  lancache-dns:
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.4
+    platform: linux/amd64
+    restart: unless-stopped
+    network_mode: host
+    entrypoint: ["/usr/local/bin/node", "/opt/lancache-gui/server/dns-service.mjs"]
+    healthcheck:
+      disable: true
+    environment:
+      GUI_CACHE_IP: "192.168.1.10"
+      GUI_DATA: "/data/manager"
+      GUI_DNS_PORT: "53"
+      TZ: "Etc/UTC"
+    volumes:
+      - type: bind
+        source: /mnt/tank/apps/super-lan-cache/manager
+        target: /data/manager
+        bind: {create_host_path: false}
+    tmpfs:
+      - /data/cache
+      - /data/logs
+      - /data/cachedomains
+      - /var/www
+    depends_on:
+      - lancache
 x-portals:
   - name: Web UI
     host: 192.168.1.10
@@ -35,6 +60,6 @@ x-portals:
     scheme: http
     path: /
 x-notes: >
-  Super Lan-Cache combines the cache engine and management interface in one container.
+  Super Lan-Cache combines the cache engine and management interface with an optional built-in DNS sidecar.
   New installs have no login password; enable one in Settings if desired.
-  Super Pi Hole is optional. Existing cache files are inventoried automatically.
+  Built-in DNS starts disabled. Super Pi Hole is optional. Existing cache files are inventoried automatically.

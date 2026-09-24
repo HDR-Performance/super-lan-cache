@@ -9,6 +9,7 @@ import {availableParallelism} from 'node:os';
 import {Store} from './store.mjs';
 import {Engine,atomic} from './engine.mjs';
 import {VERSION,digest,compileCatalog} from './model.mjs';
+import {DNS_CONFIG_FILE,DNS_STATUS_FILE,defaultDnsConfig,validateDnsConfig} from './dns-service.mjs';
 const base=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 export function createApp(options={}){
  process.umask(0o077);
@@ -29,6 +30,10 @@ export function createApp(options={}){
 
  let integration=store.get('integration')||{enabled:false,instanceId:randomUUID(),tokenHash:null};store.set('integration',integration);
  const registryPath=path.join(base,'vendor/cache-domains');const registry=JSON.parse(fs.readFileSync(path.join(registryPath,'cache_domains.json'),'utf8'));const services=compileCatalog(registry,f=>fs.readFileSync(path.join(registryPath,f),'utf8'));const revision=digest(JSON.stringify(services));
+ const dnsConfigFile=path.join(data,DNS_CONFIG_FILE),dnsStatusFile=path.join(data,DNS_STATUS_FILE);
+ if(!fs.existsSync(dnsConfigFile)){const initial={...defaultDnsConfig(services,addresses),catalogRevision:revision};atomic(dnsConfigFile,JSON.stringify(initial,null,2)+'\n',0o600);}
+ function readJson(file,fallback){try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return fallback;}}
+ function dnsSnapshot(){const config=readJson(dnsConfigFile,{...defaultDnsConfig(services,addresses),catalogRevision:revision}),reported=readJson(dnsStatusFile,null);let status=reported;const stale=config.enabled&&(!reported?.updatedAt||Date.now()-Date.parse(reported.updatedAt)>30000);if(!status||stale)status={state:config.enabled?'unavailable':'off',ready:false,enabled:config.enabled,port:Number(process.env.GUI_DNS_PORT||53),message:config.enabled?'The built-in DNS sidecar is not reporting. Check the app workload.':'Built-in DNS is disabled.'};else if(reported.revision!==undefined&&reported.revision!==config.revision)status={...reported,state:'applying',ready:false,message:'Applying the saved DNS settings.'};return {config,status,catalogRevision:revision,sidecarExpected:process.env.GUI_DNS_SIDECAR!=='false'};}
  const resolveDns=options.resolveDns||(async(server,domain,family)=>{const resolver=new Resolver({timeout:2500,tries:1});resolver.setServers([server]);try{return family===6?await resolver.resolve6(domain):await resolver.resolve4(domain);}finally{resolver.cancel();}});
  const sessions=new Map(),limits=new Map(),streams=new Set();let lastNetwork=null,telemetry={sampledAt:Date.now(),engine:{healthy:false,reason:'Checking engine'},network:null};let metricsBusy=false;let summaryCache=null,summaryAt=0;
  function audit(type,detail){const id=store.job(type);store.progress(id,'complete',detail);}
@@ -77,6 +82,7 @@ export function createApp(options={}){
     if(route==='/api/library'&&req.method==='GET')return json(res,200,store.library(Object.fromEntries(url.searchParams)));
     if(route==='/api/versions'&&req.method==='GET')return json(res,200,{versions:store.versions()});
     if(route==='/api/services'&&req.method==='GET')return json(res,200,{revision,services,addresses,standalone:true});
+    if(route==='/api/dns/service'&&req.method==='GET')return json(res,200,dnsSnapshot());
     if(route==='/api/settings'&&req.method==='GET')return json(res,200,{...engine.state(),passwordRequired:auth.enabled});
     if(route==='/api/integration'&&req.method==='GET')return json(res,200,{enabled:integration.enabled,instanceId:integration.instanceId,hasToken:!!integration.tokenHash,managementUrl:origin});
     if(req.method!=='POST')return json(res,404,{error:'Endpoint not found'});
@@ -103,6 +109,10 @@ export function createApp(options={}){
      const rules=new Map();for(const s of selected)for(const r of s.rules)rules.set(`${r.type}:${r.domain}`,r);
      const text=['# LanCache GUI generated dnsmasq configuration','# Review before installing in your independently managed DNS server.',...Array.from(rules.values()).flatMap(r=>r.type==='exact'?[`host-record=${r.domain},${b.address}`]:[`address=/*.${r.domain}/${b.address}`,`local=/*.${r.domain}/`])].join('\n')+'\n';
      return json(res,200,{filename:'lancache-dnsmasq.conf',content:text,revision,note:'Validate exact/wildcard semantics with your dnsmasq version. No DNS server was changed.'});
+    }
+    if(route==='/api/dns/service'){
+     const current=readJson(dnsConfigFile,{...defaultDnsConfig(services,addresses),catalogRevision:revision});const checked=validateDnsConfig(b,services,addresses,current.revision);
+     const next={...checked,revision:current.revision+1,catalogRevision:revision,updatedAt:new Date().toISOString()};atomic(dnsConfigFile,JSON.stringify(next,null,2)+'\n',0o600);audit('Built-in DNS',{enabled:next.enabled,listenAddress:next.listenAddress,serviceCount:next.selectedServices.length,revision:next.revision});return json(res,200,dnsSnapshot());
     }
     if(route==='/api/dns/validate'){
      if(!isIP(b.address)||!isIP(b.dnsServer)||!Array.isArray(b.services)||b.services.length<1||b.services.length>services.length)throw Error('Choose a cache IP, DNS resolver IP, and at least one service');

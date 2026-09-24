@@ -15,6 +15,8 @@ export class Store{
    CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY,service TEXT,product TEXT,version TEXT,kind TEXT,title TEXT,custom_title TEXT,first_seen INTEGER,last_seen INTEGER,bytes_served INTEGER DEFAULT 0,hit_bytes INTEGER DEFAULT 0,requests INTEGER DEFAULT 0);
    CREATE TABLE IF NOT EXISTS files(hash TEXT PRIMARY KEY,relative TEXT NOT NULL,item_id TEXT NOT NULL,size INTEGER NOT NULL,mtime REAL NOT NULL,inode TEXT,key TEXT NOT NULL,generation TEXT NOT NULL);
    CREATE INDEX IF NOT EXISTS files_item ON files(item_id);
+   CREATE TABLE IF NOT EXISTS inventory_totals(id INTEGER PRIMARY KEY CHECK(id=1),files INTEGER NOT NULL,bytes INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS inventory_items(item_id TEXT PRIMARY KEY,files INTEGER NOT NULL,bytes INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,time INTEGER,service TEXT,client TEXT,item_id TEXT,status INTEGER,bytes INTEGER,cache TEXT);
    CREATE INDEX IF NOT EXISTS events_time ON events(time);
    CREATE TABLE IF NOT EXISTS stream_events(id INTEGER PRIMARY KEY,time INTEGER,service TEXT,client TEXT,server TEXT,status INTEGER,bytes_sent INTEGER,bytes_received INTEGER,duration REAL);
@@ -23,7 +25,37 @@ export class Store{
    CREATE TABLE IF NOT EXISTS buckets(time INTEGER,service TEXT,bytes INTEGER,hits INTEGER,requests INTEGER,PRIMARY KEY(time,service));
    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,type TEXT,state TEXT,created INTEGER,updated INTEGER,details TEXT);
    CREATE TABLE IF NOT EXISTS manifest_refs(version_id TEXT,hash TEXT,PRIMARY KEY(version_id,hash));
+   CREATE INDEX IF NOT EXISTS manifest_refs_hash ON manifest_refs(hash);
    CREATE TABLE IF NOT EXISTS manifests(id TEXT PRIMARY KEY,title TEXT,version TEXT,retained INTEGER,source TEXT,complete INTEGER);
+  `);
+  // Existing multi-million-file installations pay this aggregation cost once
+  // during migration. Triggers keep the dashboard total constant-time after it.
+  if(!this.db.prepare('SELECT 1 ok FROM inventory_totals WHERE id=1').get()){
+   const total=this.db.prepare('SELECT COUNT(*) files,COALESCE(SUM(size),0) bytes FROM files').get();
+   this.db.prepare('INSERT INTO inventory_totals VALUES(1,?,?)').run(total.files,total.bytes);
+  }
+  if(!this.db.prepare('SELECT 1 ok FROM inventory_items LIMIT 1').get()&&this.db.prepare('SELECT files FROM inventory_totals WHERE id=1').get().files){
+   this.db.exec('INSERT INTO inventory_items SELECT item_id,COUNT(*),SUM(size) FROM files GROUP BY item_id');
+  }
+  this.db.exec(`
+   CREATE TRIGGER IF NOT EXISTS files_total_insert AFTER INSERT ON files BEGIN
+    UPDATE inventory_totals SET files=files+1,bytes=bytes+NEW.size WHERE id=1;
+    INSERT INTO inventory_items VALUES(NEW.item_id,1,NEW.size) ON CONFLICT(item_id) DO UPDATE SET files=files+1,bytes=bytes+NEW.size;
+   END;
+   CREATE TRIGGER IF NOT EXISTS files_total_delete AFTER DELETE ON files BEGIN
+    UPDATE inventory_totals SET files=MAX(0,files-1),bytes=MAX(0,bytes-OLD.size) WHERE id=1;
+    UPDATE inventory_items SET files=MAX(0,files-1),bytes=MAX(0,bytes-OLD.size) WHERE item_id=OLD.item_id;
+    DELETE FROM inventory_items WHERE item_id=OLD.item_id AND files=0;
+   END;
+   CREATE TRIGGER IF NOT EXISTS files_total_resize AFTER UPDATE OF size ON files WHEN OLD.item_id=NEW.item_id AND OLD.size<>NEW.size BEGIN
+    UPDATE inventory_totals SET bytes=MAX(0,bytes+NEW.size-OLD.size) WHERE id=1;
+    UPDATE inventory_items SET bytes=MAX(0,bytes+NEW.size-OLD.size) WHERE item_id=NEW.item_id;
+   END;
+   CREATE TRIGGER IF NOT EXISTS files_total_move AFTER UPDATE OF item_id ON files WHEN OLD.item_id<>NEW.item_id BEGIN
+    UPDATE inventory_items SET files=MAX(0,files-1),bytes=MAX(0,bytes-OLD.size) WHERE item_id=OLD.item_id;
+    DELETE FROM inventory_items WHERE item_id=OLD.item_id AND files=0;
+    INSERT INTO inventory_items VALUES(NEW.item_id,1,NEW.size) ON CONFLICT(item_id) DO UPDATE SET files=files+1,bytes=bytes+NEW.size;
+   END;
   `);
   this.db.prepare("UPDATE jobs SET state='interrupted' WHERE state IN ('running','queued')").run();
   this.scanState=this.get('scan')||{state:'not_started',files:0};this.logState=this.get('logState')||{offset:0,inode:null,records:0};this.streamLogState=this.get('streamLogState')||{offset:0,inode:null,records:0};
@@ -108,7 +140,7 @@ export class Store{
  }
  library({q='',service='',offset=0}={}){
   const where='WHERE (?=\'\' OR i.service=?) AND (?=\'\' OR COALESCE(i.custom_title,i.title) LIKE ? OR i.product LIKE ?)';const args=[service,service,q,`%${q}%`,`%${q}%`];
-  const rows=this.db.prepare(`SELECT i.*,COALESCE(f.resident_bytes,0) resident_bytes,COALESCE(f.file_count,0) file_count FROM items i LEFT JOIN (SELECT item_id,SUM(size) resident_bytes,COUNT(*) file_count FROM files GROUP BY item_id) f ON f.item_id=i.id ${where} ORDER BY resident_bytes DESC,i.last_seen DESC LIMIT 100 OFFSET ?`).all(...args,Math.max(0,Number(offset)||0));
+  const rows=this.db.prepare(`SELECT i.*,COALESCE(f.bytes,0) resident_bytes,COALESCE(f.files,0) file_count FROM items i LEFT JOIN inventory_items f ON f.item_id=i.id ${where} ORDER BY resident_bytes DESC,i.last_seen DESC LIMIT 100 OFFSET ?`).all(...args,Math.max(0,Number(offset)||0));
   return {rows,total:this.db.prepare(`SELECT COUNT(*) n FROM items i ${where}`).get(...args).n,scan:this.scanState};
  }
  activity({windowMs=30*60000,gapMs=120000,activeMs=20000,now=Date.now()}={}){
@@ -142,11 +174,14 @@ export class Store{
  shouldAutoScan(engineState,now=Date.now()){
   if(this.scanning||this.mutating||!this.logState.caughtUp||!engineState?.healthy||!engineState.connections)return false;const active=(engineState.connections.reading||0)+(engineState.connections.writing||0)>0;if(active)return false;
   const settledMiss=this.inventoryDirty&&this.inventoryDirtyAt>0&&now-this.inventoryDirtyAt>5*60000;
+  // A full inventory walks millions of files on established caches. Never
+  // start another dirty-cache reconciliation immediately after one completes.
+  const dirtyScanDue=settledMiss&&now-(this.scanState.completedAt||0)>6*60*60000;
   const incomplete=this.scanState.state!=='complete'&&now-(this.scanState.interruptedAt||this.scanState.completedAt||this.scanState.startedAt||now)>30*60000;
-  const periodic=this.scanState.state==='complete'&&now-(this.scanState.completedAt||0)>24*60*60000;return settledMiss||incomplete||periodic;
+  const periodic=this.scanState.state==='complete'&&now-(this.scanState.completedAt||0)>24*60*60000;return dirtyScanDue||incomplete||periodic;
  }
  summary(){
-  const disk=this.db.prepare('SELECT COALESCE(SUM(size),0) bytes,COUNT(*) files FROM files').get();const totals=this.db.prepare('SELECT COALESCE(SUM(bytes_served),0) bytes,COALESCE(SUM(hit_bytes),0) hits,COALESCE(SUM(requests),0) requests FROM items').get();
+  const disk=this.db.prepare('SELECT bytes,files FROM inventory_totals WHERE id=1').get();const totals=this.db.prepare('SELECT COALESCE(SUM(bytes_served),0) bytes,COALESCE(SUM(hit_bytes),0) hits,COALESCE(SUM(requests),0) requests FROM items').get();
   const services=this.db.prepare('SELECT service,SUM(bytes_served) bytes,SUM(hit_bytes) hits,SUM(requests) requests,COUNT(*) items FROM items GROUP BY service ORDER BY bytes DESC').all();
   const events=this.db.prepare('SELECT e.*,COALESCE(i.custom_title,i.title) title,i.version FROM events e JOIN items i ON i.id=e.item_id ORDER BY e.id DESC LIMIT 50').all();
   const chart=this.db.prepare('SELECT time,SUM(bytes) bytes,SUM(hits) hits FROM buckets WHERE time>? GROUP BY time ORDER BY time').all(Date.now()-15*60*1000);
@@ -154,40 +189,67 @@ export class Store{
   return {disk,totals,services,events,activity:this.activity(),passthrough:this.passthrough(),chart,space,index:this.scanState,logs:this.logState,streamLogs:this.streamLogState,jobs:this.jobs(),manifestCount:this.db.prepare('SELECT COUNT(*) n FROM manifests').get().n};
  }
  rename(id,title){if(typeof title!=='string'||title.length>180)throw Error('Name must be at most 180 characters');this.db.prepare('UPDATE items SET custom_title=? WHERE id=?').run(title.trim()||null,id);}
+ cleanupWhere(plan,{after=0,limit=0,protectedOnly=false}={}){
+  const marks=plan.ids.map(()=>'?').join(','),selected=plan.mode==='versions'
+   ?`EXISTS(SELECT 1 FROM manifest_refs selected WHERE selected.hash=f.hash AND selected.version_id IN (${marks}))`
+   :`f.item_id IN (${marks}) AND (?=0 OR (i.last_seen>0 AND i.last_seen<?))`;
+  const protectedSql=plan.mode==='versions'
+   ?`EXISTS(SELECT 1 FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=f.hash AND m.retained=1 AND r.version_id NOT IN (${marks}))`
+   :plan.hasRetained?`EXISTS(SELECT 1 FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=f.hash AND m.retained=1)`:'0';
+  const args=plan.mode==='versions'?[...plan.ids]:[...plan.ids,plan.cutoff,plan.cutoff];
+  let where=`${selected} AND ${protectedOnly?'':'NOT '}${protectedSql}`;
+  if(plan.mode==='versions')args.push(...plan.ids);
+  if(after){where+=' AND f.rowid>?';args.push(after);}
+  if(limit)args.push(limit);
+  return {where,args,limit:limit?' LIMIT ?':''};
+ }
+ cleanupSummary(plan,protectedOnly=false){
+  if(plan.mode==='items'){
+   if(protectedOnly){
+    if(!plan.hasRetained)return {files:0,bytes:0};
+    const marks=plan.ids.map(()=>'?').join(',');
+    return this.db.prepare(`SELECT COUNT(*) files,COALESCE(SUM(f.size),0) bytes FROM files f JOIN items i ON i.id=f.item_id JOIN (SELECT DISTINCT r.hash FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE m.retained=1) protected ON protected.hash=f.hash WHERE f.item_id IN (${marks}) AND (?=0 OR (i.last_seen>0 AND i.last_seen<?))`).get(...plan.ids,plan.cutoff,plan.cutoff);
+   }
+   const marks=plan.ids.map(()=>'?').join(','),total=this.db.prepare(`SELECT COALESCE(SUM(v.files),0) files,COALESCE(SUM(v.bytes),0) bytes FROM inventory_items v JOIN items i ON i.id=v.item_id WHERE v.item_id IN (${marks}) AND (?=0 OR (i.last_seen>0 AND i.last_seen<?))`).get(...plan.ids,plan.cutoff,plan.cutoff);
+   if(!plan.hasRetained)return total;
+   const protectedFiles=this.cleanupSummary(plan,true);return {files:total.files-protectedFiles.files,bytes:total.bytes-protectedFiles.bytes};
+  }
+  const q=this.cleanupWhere(plan,{protectedOnly});
+  return this.db.prepare(`SELECT COUNT(*) files,COALESCE(SUM(f.size),0) bytes FROM files f JOIN items i ON i.id=f.item_id WHERE ${q.where}`).get(...q.args);
+ }
+ cleanupBatch(plan,after,limit=250){
+  const q=this.cleanupWhere(plan,{after,limit});
+  return this.db.prepare(`SELECT f.rowid _cursor,f.* FROM files f JOIN items i ON i.id=f.item_id WHERE ${q.where} ORDER BY f.rowid${q.limit}`).all(...q.args);
+ }
  plan(ids,{mode='items',days=0}={}){
   if(this.scanning||this.mutating)throw Error('Wait for indexing or maintenance to finish');if(!Array.isArray(ids)||ids.length<1||ids.length>100||ids.some(x=>typeof x!=='string'||x.length>100))throw Error('Select 1–100 items');
-  let files=[];let protectedCount=0;
-  if(mode==='versions'){
-   for(const id of ids){const m=this.db.prepare('SELECT * FROM manifests WHERE id=?').get(id);if(!m||!m.complete)throw Error('Version requires an explicitly complete manifest before exclusive-chunk cleanup');}
-   const candidates=this.db.prepare(`SELECT DISTINCT f.* FROM files f JOIN manifest_refs r ON r.hash=f.hash WHERE r.version_id IN (${ids.map(()=>'?')})`).all(...ids);
-   files=candidates.filter(f=>{const refs=this.db.prepare(`SELECT COUNT(*) n FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=? AND m.retained=1 AND r.version_id NOT IN (${ids.map(()=>'?')})`).get(f.hash,...ids);if(refs.n){protectedCount++;return false;}return true;});
-  }else{
-   files=this.db.prepare(`SELECT f.*,i.last_seen FROM files f JOIN items i ON i.id=f.item_id WHERE f.item_id IN (${ids.map(()=>'?')})`).all(...ids).filter(f=>!days||(f.last_seen>0&&f.last_seen<Date.now()-days*86400000));
-   // Imported retained manifests protect chunks even during manual item removal.
-   files=files.filter(f=>{if(this.db.prepare('SELECT COUNT(*) n FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=? AND m.retained=1').get(f.hash).n){protectedCount++;return false;}return true;});
-  }
-  if(files.length>100000)throw Error('Select a smaller group: maximum 100,000 files per cleanup job');
-  const plan={id:randomUUID(),created:Date.now(),expires:Date.now()+10*60000,mode,ids,files,protectedCount,bytes:files.reduce((n,f)=>n+f.size,0)};this.set('plan:'+plan.id,plan);
-  return {id:plan.id,expires:plan.expires,files:files.length,bytes:plan.bytes,protectedCount,mode,requiresConfirmation:'DELETE',note:mode==='versions'?'Exclusive relative to imported retained manifests; completeness depends on the supplied metadata.':'Removes selected cached content. Clients can download it again. History is retained.'};
+  ids=[...new Set(ids)];const created=Date.now(),cutoff=days?created-days*86400000:0;
+  if(mode==='versions')for(const id of ids){const m=this.db.prepare('SELECT * FROM manifests WHERE id=?').get(id);if(!m||!m.complete)throw Error('Version requires an explicitly complete manifest before exclusive-chunk cleanup');}
+  const hasRetained=mode==='items'&&!!this.db.prepare('SELECT 1 ok FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE m.retained=1 LIMIT 1').get();
+  const plan={id:randomUUID(),created,expires:created+10*60000,mode,ids,cutoff,hasRetained};
+  const removable=this.cleanupSummary(plan),protectedFiles=this.cleanupSummary(plan,true);Object.assign(plan,{files:removable.files,bytes:removable.bytes,protectedCount:protectedFiles.files});this.set('plan:'+plan.id,plan);
+  return {id:plan.id,expires:plan.expires,selections:ids.length,files:plan.files,bytes:plan.bytes,protectedCount:plan.protectedCount,mode,requiresConfirmation:'DELETE',note:mode==='versions'?'Exclusive relative to imported retained manifests; completeness depends on the supplied metadata.':'Removes selected cached content. Clients can download it again. History is retained.'};
  }
  async execute(planId,engine){
   const plan=this.get('plan:'+planId);if(!plan||plan.expires<Date.now())throw Error('Cleanup preview expired; create a new preview');if(this.mutating||this.scanning||engine.busy)throw Error('Maintenance is already running');
   if(!engine.enabled)throw Error('Cleanup requires the managed cache engine');
-  this.set('plan:'+planId,null);this.mutating=true;engine.busy=true;const job=this.job('cleanup',{files:plan.files.length,bytes:plan.bytes});
-  const details={deleted:0,bytes:0,skipped:0,total:plan.files.length};
+  this.set('plan:'+planId,null);this.mutating=true;engine.busy=true;const job=this.job('cleanup',{files:plan.files,bytes:plan.bytes,selections:plan.ids.length});
+  const details={deleted:0,bytes:0,skipped:0,total:plan.files,selections:plan.ids.length};
   (async()=>{let stopped=false;try{
     await engine.stop();stopped=true;
-    for(const file of plan.files){
-     const target=path.resolve(this.cache,file.relative);if(!target.startsWith(this.cache+path.sep)||!/^([a-f0-9]{2}[\\/]){2}[a-f0-9]{32}$/.test(file.relative))throw Error('Unsafe cached file path');
-     if(await fsp.realpath(path.dirname(target))!==path.dirname(target))throw Error('Symlink in cached file path');
-     const current=this.db.prepare('SELECT * FROM files WHERE hash=?').get(file.hash);if(!current||current.key!==file.key||current.mtime!==file.mtime){details.skipped++;continue;}
-     const protectedRefs=this.db.prepare('SELECT r.version_id FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=? AND m.retained=1').all(file.hash);
-     if(protectedRefs.some(r=>plan.mode!=='versions'||!plan.ids.includes(r.version_id))){details.skipped++;continue;}
-     let handle;try{const st=await fsp.lstat(target);if(!st.isFile()||st.isSymbolicLink()||st.size!==file.size||st.mtimeMs!==file.mtime||String(st.ino)!==file.inode){details.skipped++;continue;}
-      handle=await fsp.open(target,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0));const buffer=Buffer.alloc(65536);const {bytesRead}=await handle.read(buffer,0,buffer.length,0);if(parseKey(buffer.subarray(0,bytesRead),file.hash)?.key!==file.key){details.skipped++;continue;}await handle.close();handle=null;
-      await fsp.unlink(target);this.db.prepare('DELETE FROM files WHERE hash=?').run(file.hash);details.deleted++;details.bytes+=file.size;
-     }catch(e){if(e.code==='ENOENT'){this.db.prepare('DELETE FROM files WHERE hash=?').run(file.hash);details.skipped++;}else throw e;}finally{await handle?.close();}
-     if((details.deleted+details.skipped)%100===0){this.progress(job,'running',details);await pause();}
+    let cursor=0;for(;;){const batch=this.cleanupBatch(plan,cursor);if(!batch.length)break;cursor=batch.at(-1)._cursor;
+     for(const file of batch){
+      const target=path.resolve(this.cache,file.relative);if(!target.startsWith(this.cache+path.sep)||!/^([a-f0-9]{2}[\\/]){2}[a-f0-9]{32}$/.test(file.relative))throw Error('Unsafe cached file path');
+      if(await fsp.realpath(path.dirname(target))!==path.dirname(target))throw Error('Symlink in cached file path');
+      const current=this.db.prepare('SELECT * FROM files WHERE hash=?').get(file.hash);if(!current||current.key!==file.key||current.mtime!==file.mtime){details.skipped++;continue;}
+      const protectedRefs=this.db.prepare('SELECT r.version_id FROM manifest_refs r JOIN manifests m ON m.id=r.version_id WHERE r.hash=? AND m.retained=1').all(file.hash);
+      if(protectedRefs.some(r=>plan.mode!=='versions'||!plan.ids.includes(r.version_id))){details.skipped++;continue;}
+      let handle;try{const st=await fsp.lstat(target);if(!st.isFile()||st.isSymbolicLink()||st.size!==file.size||st.mtimeMs!==file.mtime||String(st.ino)!==file.inode){details.skipped++;continue;}
+       handle=await fsp.open(target,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0));const buffer=Buffer.alloc(65536);const {bytesRead}=await handle.read(buffer,0,buffer.length,0);if(parseKey(buffer.subarray(0,bytesRead),file.hash)?.key!==file.key){details.skipped++;continue;}await handle.close();handle=null;
+       await fsp.unlink(target);this.db.prepare('DELETE FROM files WHERE hash=?').run(file.hash);details.deleted++;details.bytes+=file.size;
+      }catch(e){if(e.code==='ENOENT'){this.db.prepare('DELETE FROM files WHERE hash=?').run(file.hash);details.skipped++;}else throw e;}finally{await handle?.close();}
+      if((details.deleted+details.skipped)%100===0){this.progress(job,'running',details);await pause();}
+     }
     }
     await engine.start();stopped=false;this.progress(job,'complete',details);
    }catch(e){details.error=e.message;this.progress(job,'failed',details);}finally{if(stopped||engine.restartRequired)try{await engine.start();}catch(e){details.recoveryError=e.message;this.progress(job,'failed',details);}engine.busy=false;this.mutating=false;}})();

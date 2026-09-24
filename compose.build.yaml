@@ -2,3 +2,6 @@ services:
   lancache:
     build: .
     pull_policy: build
+  lancache-dns:
+    build: .
+    pull_policy: build
