@@ -1,6 +1,8 @@
-# Super Lan-Cache 0.1.4
+# Super Lan-Cache 0.1.5
 
 This testing update adds an optional built-in DNS service so a standalone installation can work after one router DHCP DNS change.
+
+Version 0.1.5 supersedes 0.1.4 and corrects the downloadable checksum manifest so all five release assets verify by their downloaded filenames.
 
 Existing 0.1.x users can update the same TrueNAS app while retaining their cache, logs and manager datasets. The release installer adds the bundled `lancache-dns` sidecar, which starts disabled, and the documented upgrade checklist preserves all existing mounts and settings. Fresh installations use the attached digest-pinned `super-lan-cache-truenas.yaml` and open without a password.
 

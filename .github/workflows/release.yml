@@ -45,5 +45,8 @@ jobs:
           docker image inspect "ghcr.io/hdr-performance/super-lan-cache:$VERSION" --format '{{index .RepoDigests 0}}' > image-digest.txt
           node deploy/release-assets.mjs
           docker compose -f super-lan-cache-truenas.yaml config --quiet
+          mkdir release-verify
+          cp super-lan-cache-truenas.yaml image-digest.txt SHA256SUMS.txt branding/icon.png branding/icon.svg release-verify/
+          (cd release-verify && sha256sum --check SHA256SUMS.txt)
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
           gh release create "v$VERSION" --verify-tag --prerelease --title "Super Lan-Cache $VERSION" --notes-file docs/RELEASE.md super-lan-cache-truenas.yaml image-digest.txt SHA256SUMS.txt branding/icon.png branding/icon.svg

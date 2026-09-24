@@ -7,5 +7,10 @@ const template=readFileSync('deploy/truenas.yaml','utf8');
 const tag='ghcr.io/hdr-performance/super-lan-cache:'+version;
 if(!template.includes(tag))throw Error('Installer version mismatch');
 writeFileSync('super-lan-cache-truenas.yaml',template.replaceAll(tag,digest),{flag:'wx'});
-const files=['super-lan-cache-truenas.yaml','image-digest.txt','branding/icon.png','branding/icon.svg'];
-writeFileSync('SHA256SUMS.txt',files.map(f=>createHash('sha256').update(readFileSync(f)).digest('hex')+'  '+f+'\n').join(''),{flag:'wx'});
+const files=[
+ {source:'super-lan-cache-truenas.yaml',name:'super-lan-cache-truenas.yaml'},
+ {source:'image-digest.txt',name:'image-digest.txt'},
+ {source:'branding/icon.png',name:'icon.png'},
+ {source:'branding/icon.svg',name:'icon.svg'}
+];
+writeFileSync('SHA256SUMS.txt',files.map(f=>createHash('sha256').update(readFileSync(f.source)).digest('hex')+'  '+f.name+'\n').join(''),{flag:'wx'});

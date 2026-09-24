@@ -45,7 +45,7 @@ Steam name refresh downloads the public `regix1/lancache-pics` mapping. It does 
 
 ## Update an existing Super Lan-Cache installation
 
-The 0.1.4 update keeps the existing cache format, library database, settings and optional password. It adds a second `lancache-dns` container to the same app; that container starts with built-in DNS disabled.
+The 0.1.5 update keeps the existing cache format, library database, settings and optional password. It adds a second `lancache-dns` container to the same app; that container starts with built-in DNS disabled.
 
 - **TrueNAS:** save the current app YAML and snapshot the manager dataset. Download the new release YAML, copy in the same server IP, cache allowance and existing cache/log/manager dataset paths, then replace the YAML in the existing app's **Edit** screen. Keep the same app name and storage paths. See the [exact upgrade checklist](docs/TRUENAS.md#upgrade-an-existing-super-lan-cache-app).
 - **Docker Compose:** from the same project directory, preserve `.env` and the existing volumes, update `compose.yaml`, then run `docker compose pull && docker compose up -d`. Do not change the Compose project name or volume mappings.

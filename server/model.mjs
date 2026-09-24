@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {isIP} from 'node:net';
-export const VERSION='0.1.4';
+export const VERSION='0.1.5';
 export const digest=s=>createHash('sha256').update(s).digest('hex');
 export const DEFAULTS={CACHE_DISK_SIZE:'1000g',CACHE_INDEX_SIZE:'500m',MIN_FREE_DISK:'10g',CACHE_MAX_AGE:'3560d',UPSTREAM_DNS:'8.8.8.8 8.8.4.4',NGINX_WORKER_PROCESSES:'auto'};
 export function validateSettings(input,addresses=[]){

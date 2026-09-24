@@ -2,7 +2,7 @@
 # Set GUI_CACHE_IP and GUI_PUBLIC_ORIGIN for your own server before deployment.
 services:
   lancache:
-    image: ghcr.io/hdr-performance/super-lan-cache:0.1.4
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.5
     restart: unless-stopped
     ports:
       - "80:80"
@@ -22,7 +22,7 @@ services:
       - logs:/data/logs
       - manager:/data/manager
   lancache-dns:
-    image: ghcr.io/hdr-performance/super-lan-cache:0.1.4
+    image: ghcr.io/hdr-performance/super-lan-cache:0.1.5
     restart: unless-stopped
     network_mode: host
     entrypoint: ["/usr/local/bin/node", "/opt/lancache-gui/server/dns-service.mjs"]
